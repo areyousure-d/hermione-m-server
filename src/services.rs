@@ -1,19 +1,39 @@
 use crate::config::AppState;
-use crate::models::{Card, CreateDeck, CreateDeckCard, Deck};
+use crate::models::{
+    AuthUser, Card, CreateDeck, CreateDeckCard, CreateUserBody, Deck, UserNoPassword,
+};
+use crate::TokenClaims;
 use actix_web::{
     get, post,
-    web::{Data, Json, Path},
+    web::{Data, Json, Path, ReqData},
     HttpResponse, Responder,
 };
+use actix_web_httpauth::extractors::basic::BasicAuth;
+use argonautica::{Hasher, Verifier};
+use hmac::{Hmac, Mac};
+use jwt::SignWithKey;
+use sha2::Sha256;
+use sqlx::{self};
 
 #[get("/decklist")]
-pub async fn fetch_decks(state: Data<AppState>) -> impl Responder {
-    match sqlx::query_as::<_, Deck>("SELECT id, deckname FROM deck")
-        .fetch_all(&state.db)
-        .await
-    {
-        Ok(decklist) => HttpResponse::Ok().json(decklist),
-        Err(_) => HttpResponse::NotFound().json("No decks found"),
+pub async fn fetch_decks(
+    state: Data<AppState>,
+    req_user: Option<ReqData<TokenClaims>>,
+) -> impl Responder {
+    match req_user {
+        Some(user) => {
+            match sqlx::query_as::<_, Deck>(
+                "SELECT id, deckname, created_by FROM deck WHERE created_by = $1",
+            )
+            .bind(user.id)
+            .fetch_all(&state.db)
+            .await
+            {
+                Ok(decklist) => HttpResponse::Ok().json(decklist),
+                Err(_) => HttpResponse::NotFound().json("No decks found"),
+            }
+        }
+        _ => HttpResponse::Unauthorized().json("Unable to verify identity"),
     }
 }
 
@@ -66,5 +86,79 @@ pub async fn create_deck_card(
     {
       Ok(card) => HttpResponse::Ok().json(card),
       Err(_) => HttpResponse::InternalServerError().json("Error in creating a deck card")
+    }
+}
+
+#[post("/user")]
+async fn create_user(state: Data<AppState>, body: Json<CreateUserBody>) -> impl Responder {
+    let user: CreateUserBody = body.into_inner();
+
+    let hash_secret = std::env::var("HASH_SECRET").expect("HASH_SECRET must be set");
+    let mut hasher = Hasher::default();
+    let hash = hasher
+        .with_password(user.password)
+        .with_secret_key(hash_secret)
+        .hash()
+        .unwrap();
+
+    match sqlx::query_as::<_, UserNoPassword>(
+        "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username",
+    )
+    .bind(user.username)
+    .bind(hash)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(user) => HttpResponse::Ok().json(user),
+        Err(error) => HttpResponse::InternalServerError().json(format!("{:?}", error)),
+    }
+}
+
+#[post("/auth")]
+async fn basic_auth(state: Data<AppState>, credentials: BasicAuth) -> impl Responder {
+    let jwt_secret: Hmac<Sha256> = Hmac::new_from_slice(
+        std::env::var("JWT_SECRET")
+            .expect("JWT_SECRET must be set")
+            .as_bytes(),
+    )
+    .unwrap();
+
+    let username = credentials.user_id();
+    let password = credentials.password();
+
+    match password {
+        None => HttpResponse::Unauthorized().json("Must provide username and password"),
+        Some(pass) => {
+            match sqlx::query_as::<_, AuthUser>(
+                "SELECT id, username, password FROM users WHERE username = $1",
+            )
+            .bind(username.to_string())
+            .fetch_one(&state.db)
+            .await
+            {
+                Ok(user) => {
+                    let hash_secret =
+                        std::env::var("HASH_SECRET").expect("HASH_SECRET must be set");
+                    let mut verifier = Verifier::default();
+                    let is_valid = verifier
+                        .with_hash(user.password)
+                        .with_password(pass)
+                        .with_secret_key(hash_secret)
+                        .verify()
+                        .unwrap();
+
+                    if is_valid {
+                        let claims = TokenClaims { id: user.id };
+                        let token_str = claims.sign_with_key(&jwt_secret).unwrap();
+                        HttpResponse::Ok().json(token_str)
+                    } else {
+                        HttpResponse::Unauthorized().json("Incorrect username or password")
+                    }
+                }
+                Err(error) => {
+                    HttpResponse::InternalServerError().json(format!("Auth error: {:?}", error))
+                }
+            }
+        }
     }
 }
