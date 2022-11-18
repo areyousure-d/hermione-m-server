@@ -14,6 +14,7 @@ use services::{
 };
 use sqlx::postgres::PgPoolOptions;
 
+use actix_cors::Cors;
 use actix_web_httpauth::{
     extractors::{
         bearer::{self, BearerAuth},
@@ -83,9 +84,11 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         let bearer_middleware = HttpAuthentication::bearer(validator);
+        let cors = Cors::permissive();
 
         App::new()
             .app_data(Data::new(config::AppState { db: pool.clone() }))
+            .wrap(cors)
             .service(basic_auth)
             .service(create_user)
             .service(
