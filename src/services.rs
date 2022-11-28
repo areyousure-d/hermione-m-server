@@ -54,16 +54,27 @@ pub async fn fetch_deck_cards(state: Data<AppState>, path: Path<i32>) -> impl Re
 }
 
 #[post("/decklist")]
-pub async fn create_deck(state: Data<AppState>, body: Json<CreateDeck>) -> impl Responder {
-    match sqlx::query_as::<_, Deck>(
-        "INSERT INTO deck (deckname) VALUES ($1) RETURNING id, deckname",
-    )
-    .bind(body.deckname.to_string())
-    .fetch_one(&state.db)
-    .await
-    {
-        Ok(deck) => HttpResponse::Ok().json(deck),
-        Err(_) => HttpResponse::InternalServerError().json("Error in creating a deck"),
+pub async fn create_deck(
+    state: Data<AppState>,
+    req_user: Option<ReqData<TokenClaims>>,
+    body: Json<CreateDeck>,
+) -> impl Responder {
+    match req_user {
+        Some(user) => {
+            match sqlx::query_as::<_, Deck>(
+                "INSERT INTO deck (deckname, created_by) VALUES ($1, $2) RETURNING id, deckname, created_by",
+            )
+            .bind(body.deckname.to_string())
+            .bind(user.id)
+            .fetch_one(&state.db)
+            .await
+            {
+                Ok(deck) => HttpResponse::Ok().json(deck),
+                //Err(_) => HttpResponse::InternalServerError().json("Error creating a deck"),
+                Err(error) => HttpResponse::InternalServerError().json(error.to_string()),
+            }
+        }
+        _ => HttpResponse::Unauthorized().json("Unable to verify identity"),
     }
 }
 
